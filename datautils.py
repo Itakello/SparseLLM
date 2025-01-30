@@ -51,7 +51,7 @@ def _shuffle_options(options, letter_map):
 def _build_user_message(record, shuffle=False):
     # Build the user part for both calibration and testing
     optC = record.get("OPTION-C", None)
-    if optC is not None:
+    if isinstance(optC, str) and len(optC) > 0:
         # 4-choice
         options = [
             record["OPTION-A"].replace("A. ", ""),
