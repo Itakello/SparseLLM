@@ -1,27 +1,11 @@
-# This file will contain functions related to the model such as loading the model, SparseLLM pruning, and evaluation.
-
-import math
-
 import torch
 import torch.nn as nn
-from transformers import LlamaForCausalLM
 
 from submodules.wanda.lib.prune import prune_wanda
 
 
-def get_llama(args):
-    def skip(*args, **kwargs):
-        pass
-
-    torch.nn.init.kaiming_uniform_ = skip
-    torch.nn.init.uniform_ = skip
-    torch.nn.init.normal_ = skip
-    model = LlamaForCausalLM.from_pretrained(args.model, torch_dtype="auto")
-    return model
-
-
 @torch.no_grad()
-def llama_sparsellm(model, tokenizer, dataloader, dev, args):
+def llama_sparsellm(model, dataloader, dev, sparsity) -> None:
     """
     Replacement of the old 'llama_sparsellm' that now calls Wanda's prune_wanda
     using the calibration data from 'dataloader'.
@@ -99,7 +83,7 @@ def llama_sparsellm(model, tokenizer, dataloader, dev, args):
     from types import SimpleNamespace
 
     wanda_args = SimpleNamespace(
-        sparsity_ratio=args.sparsity,  # Wanda expects e.g. 0.5 for 50%
+        sparsity_ratio=sparsity,  # Wanda expects e.g. 0.5 for 50%
         # Because we do unstructured by default
         sparsity_type="unstructured",
         prune_method="wanda",  # Hard-coded for Wanda

@@ -48,14 +48,9 @@ def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
     return trainloader, testenc
 
 
-def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=""):
+def get_loader_wikitext2(name, nsamples=128, seed=0, seqlen=2048, model=""):
     tokenizer = get_tokenizer(model)
-    if "wikitext2" in name:
-        return get_wikitext2(nsamples, seed, seqlen, model, tokenizer)
-    if "ptb" in name:
-        return get_ptb(nsamples, seed, seqlen, model, tokenizer)
-    if "c4" in name:
-        return get_c4(nsamples, seed, seqlen, model, tokenizer)
+    return get_wikitext2(nsamples, seed, seqlen, model, tokenizer)
 
 
 def _build_calibration_prompt(record):

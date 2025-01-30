@@ -3,7 +3,7 @@
 import argparse
 
 import torch
-from datautils import get_loaders
+from datautils import get_loader_wikitext2
 from model_utils import get_llama, llama_eval, llama_sparsellm
 
 
@@ -18,7 +18,7 @@ def main():
 
     model = get_llama(args)
     model.eval()
-    dataloader, testloader = get_loaders(
+    dataloader, testloader = get_loader_wikitext2(
         args.dataset,
         nsamples=args.nsamples,
         seed=args.seed,
@@ -31,7 +31,7 @@ def main():
 
     # Evaluate
     for dataset in ["wikitext2", "ptb", "c4"]:
-        dataloader, testloader = get_loaders(
+        dataloader, testloader = get_loader_wikitext2(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         llama_eval(model, testloader, torch.device("cuda"), args, dataset)
