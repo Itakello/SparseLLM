@@ -2,30 +2,16 @@ import json
 import os
 import random
 
-import numpy as np
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.random.manual_seed(seed)
-
-
-def get_tokenizer(model):
-    if "llama" in model.lower():
-        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-        # fix for transformer 4.28.0.dev0 compatibility
-        if tokenizer.bos_token_id != 1 or tokenizer.eos_token_id != 2:
-            try:
-                tokenizer.bos_token_id = 1
-                tokenizer.eos_token_id = 2
-            except AttributeError:
-                pass
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-    return tokenizer
+SYSTEM_PROMPT = """Below is a multiple-choice question with a story and several answer options. Based on the content of the story and the given question, please infer the most likely answer and output the answer index.
+Note:
+(1) Please only output the most likely answer index in the format: [[Answer Index]];
+(2) You must choose one of A, B, C, D even if the story doesn't have enough info;
+(3) Output only the answer index, nothing else.
+"""
 
 
 def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
@@ -48,70 +34,80 @@ def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
     return trainloader, testenc
 
 
-def get_loader_wikitext2(name, nsamples=128, seed=0, seqlen=2048, model=""):
-    tokenizer = get_tokenizer(model)
+def get_loader_wikitext2(nsamples=128, seed=0, seqlen=2048, model=""):
+    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
     return get_wikitext2(nsamples, seed, seqlen, model, tokenizer)
 
 
-def _build_calibration_prompt(record):
-    """
-    Build a single text block that includes the 'correct' answer,
-    so that the pruning procedure can see relevant text+labels.
-    For example:
+def _shuffle_options(options, letter_map):
+    """Helper function to shuffle options while maintaining answer mapping"""
+    items = list(zip(options, letter_map.keys()))
+    random.shuffle(items)
+    shuffled_options, shuffled_keys = zip(*items)
+    new_letter_map = {old: new for old, new in zip(letter_map.keys(), shuffled_keys)}
+    return shuffled_options, new_letter_map
 
-      [SYSTEM]
-      <some instruction about picking A/B/C/D>
 
-      [USER]
-      <Story + 4 candidate answers in canonical order>
-
-      [ASSISTANT]
-      [[CORRECT_ANSWER]]
-    """
-    # Simple system instruction
-    system_prompt = """Below is a multiple-choice question with a story and several answer options. Based on the content of the story and the given question, please infer the most likely answer and output the answer index.
-    Note:
-    (1) Please only output the most likely answer index in the format: [[Answer Index]];
-    (2) You must choose one of A, B, C, D even if the story doesn't have enough info;
-    (3) Output only the answer index, nothing else.
-    """
-
-    # Distinguish whether we have 4 choices or 2
+def _build_user_message(record, shuffle=False):
+    # Build the user part for both calibration and testing
     optC = record.get("OPTION-C", None)
     if optC is not None:
         # 4-choice
-        A = record["OPTION-A"].replace("A. ", "")
-        B = record["OPTION-B"].replace("B. ", "")
-        C = record["OPTION-C"].replace("C. ", "")
-        D = record["OPTION-D"].replace("D. ", "")
-        user_part = (
+        options = [
+            record["OPTION-A"].replace("A. ", ""),
+            record["OPTION-B"].replace("B. ", ""),
+            record["OPTION-C"].replace("C. ", ""),
+            record["OPTION-D"].replace("D. ", ""),
+        ]
+        letter_map = {"A": "A", "B": "B", "C": "C", "D": "D"}
+
+        if shuffle:
+            options, letter_map = _shuffle_options(options, letter_map)
+
+        user_msg = (
             f"[Story]\n{record['STORY']}\n\n"
             f"[Question]\n{record['QUESTION']}\n\n"
             f"[Candidate Answers]\n"
-            f"A. {A}\n"
-            f"B. {B}\n"
-            f"C. {C}\n"
-            f"D. {D}"
+            f"A. {options[0]}\n"
+            f"B. {options[1]}\n"
+            f"C. {options[2]}\n"
+            f"D. {options[3]}"
         )
     else:
         # 2-choice
-        A = record["OPTION-A"].replace("A. ", "")
-        B = record["OPTION-B"].replace("B. ", "")
-        user_part = (
+        options = [
+            record["OPTION-A"].replace("A. ", ""),
+            record["OPTION-B"].replace("B. ", ""),
+        ]
+        letter_map = {"A": "A", "B": "B"}
+
+        if shuffle:
+            options, letter_map = _shuffle_options(options, letter_map)
+
+        user_msg = (
             f"[Story]\n{record['STORY']}\n\n"
             f"[Question]\n{record['QUESTION']}\n\n"
             f"[Candidate Answers]\n"
-            f"A. {A}\n"
-            f"B. {B}"
+            f"A. {options[0]}\n"
+            f"B. {options[1]}"
         )
+    return user_msg, letter_map
 
-    answer = record.get("ANSWER\nANSWER", "A") or "A"
-    assistant_part = f"[[{answer}]]"
 
-    text_block = (
-        f"[SYSTEM]\n{system_prompt}\n"
-        f"[USER]\n{user_part}\n"
-        f"[ASSISTANT]\n{assistant_part}"
+def _build_calibration_prompt(record, tokenizer):
+
+    user_msg, _ = _build_user_message(
+        record, shuffle=False
+    )  # no shuffle for calibration
+    answer = record.get("ANSWER", "A") or "A"
+    assistant_msg = f"[[{answer}]]"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": assistant_msg},
+    ]
+    text_block = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
     )
     return text_block
 
@@ -155,7 +151,7 @@ def get_tom(tokenizer, subtask_file, train_num=32, test_num=5, seed=42):
 
     # 2) Build calibration prompts
 
-    train_prompts = [_build_calibration_prompt(r) for r in train_records]
+    train_prompts = [_build_calibration_prompt(r, tokenizer) for r in train_records]
 
     # 3) Tokenize each prompt (variable length)
     encoded_list = []

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from submodules.wanda.lib.prune import prune_wanda
+from submodules.wanda.prune import prune_wanda
 
 
 @torch.no_grad()
