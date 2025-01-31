@@ -6,12 +6,11 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-SYSTEM_PROMPT = """Below is a multiple-choice question with a story and several answer options. Based on the content of the story and the given question, please infer the most likely answer and output the answer index.
+SYSTEM_PROMPT = """Below is a multiple-choice question with a story and serveral answer options. Based on the content of the story and the given question, please infer the most likely answer and output the answer index.
 Note:
-(1) Please only output the most likely answer index in the format: [[Answer Index]];
-(2) You must choose one of A, B, C, D even if the story doesn't have enough info;
-(3) Output only the answer index, nothing else.
-"""
+(1) Please only output the most likely answer index in the format: [[Answer Index]], for example, if the most likely answer option is 'A. Handbag', then output '[[A]]';
+(2) You must choose one of the given answer options 'A, B, C, D' as the most likely answer, regardless of whether the story provides enough information. If you think there is not enough information in the story to choose an answer, please randomly output one of "[[A]]", "[[B]]", "[[C]]", or "[[D]]";
+(3) Please only output the most likely answer index based on the given information, and do not output any other content."""
 
 
 def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
