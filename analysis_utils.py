@@ -1,413 +1,551 @@
-import os
 import csv
+import gc
+import os
+
+import numpy as np
 import torch
-import math
-from transformers import PreTrainedModel
+from transformers import AutoModelForCausalLM, PreTrainedModel
+
+
+def clear_gpu_memory():
+    """Frees GPU memory (if CUDA is available)."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 def _ensure_results_dir():
-    """
-    Ensures that the './results' directory exists.
-    If not, creates it.
-    """
+    """Ensures that the 'results/' directory exists."""
     if not os.path.exists("results"):
         os.makedirs("results")
 
 
-def extract_zero_mask(tensor: torch.Tensor):
+def load_model(model_path: str) -> PreTrainedModel:
     """
-    Given a tensor, return a Boolean mask where True means 'weight is nonzero'.
-    This helps identify which weights survived pruning.
+    Load a model in full precision or auto precision, clearing GPU memory first.
+    Adjust to your specific device or config as needed.
     """
-    return tensor != 0.0
+    clear_gpu_memory()
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype="auto", low_cpu_mem_usage=True
+    ).to("cuda")
+    return model
 
 
-def extract_llama_masks(model: PreTrainedModel):
+def extract_model_details(model_path: str):
     """
-    Given a pruned LLaMA model, returns a dict of {layer_name: mask (bool Tensor)}
-    for all weight matrices (typically nn.Linear in each transformer block).
-
-    Note: This function assumes your model structure includes `model.model.layers[i]`.
-          Adjust as needed if your model has a different naming.
+    Basic string-parsing for:
+      model_type   (either 'raw' or 'pruned', guessed from the path)
+      model_name   (the 'base' name)
+      pruned_on    (a subtask name or 'None')
+      sparsity     (e.g. '25%', '50%', etc.)
+    Adapt as needed depending on your naming conventions.
     """
-    masks = {}
-    for i, layer in enumerate(model.model.layers):
-        for name, param in layer.named_parameters():
-            # e.g. name = 'self_attn.q_proj.weight' or 'mlp.up_proj.weight'
-            # We only care about weight parameters, not biases
-            if "weight" in name:
-                full_name = f"layers.{i}.{name}"
-                masks[full_name] = extract_zero_mask(param.data)
-    return masks
-
-
-def get_global_sparsity(model: PreTrainedModel, model_id: str = "model"):
-    """
-    Computes overall fraction of weights that are pruned across the entire model.
-    Saves CSV file: `results/global_sparsity_{model_id}.csv`.
-
-    CSV columns:
-      - total_params
-      - nonzero_params
-      - fraction_pruned  (pruned / total)
-      - fraction_remaining (1 - fraction_pruned)
-    """
-    _ensure_results_dir()
-    total_params = 0
-    nonzero_params = 0
-    for param in model.parameters():
-        if param.dim() == 0:
-            continue  # skip scalars
-        data = param.data
-        total_params += data.numel()
-        nonzero_params += torch.count_nonzero(data).item()
-
-    fraction_pruned = (total_params - nonzero_params) / total_params
-    fraction_remaining = 1.0 - fraction_pruned
-
-    csv_path = f"results/global_sparsity_{model_id}.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            ["total_params", "nonzero_params", "fraction_pruned", "fraction_remaining"]
-        )
-        writer.writerow(
-            [total_params, nonzero_params, fraction_pruned, fraction_remaining]
-        )
-
-
-def get_per_layer_sparsity(model: PreTrainedModel, model_id: str = "model"):
-    """
-    Computes fraction of nonzero weights *per layer* for the model.
-    Saves CSV file: `results/per_layer_sparsity_{model_id}.csv`.
-
-    CSV columns:
-      - layer_name
-      - total_params
-      - nonzero_params
-      - fraction_pruned
-      - fraction_remaining
-    """
-    _ensure_results_dir()
-    rows = []
-    for i, layer in enumerate(model.model.layers):
-        layer_total = 0
-        layer_nonzero = 0
-
-        for name, param in layer.named_parameters():
-            if "weight" not in name:
-                continue
-            data = param.data
-            layer_total += data.numel()
-            layer_nonzero += torch.count_nonzero(data).item()
-
-        fraction_pruned = (layer_total - layer_nonzero) / layer_total
-        fraction_remaining = 1.0 - fraction_pruned
-        rows.append(
-            [
-                f"layer_{i}",
-                layer_total,
-                layer_nonzero,
-                fraction_pruned,
-                fraction_remaining,
-            ]
-        )
-
-    csv_path = f"results/per_layer_sparsity_{model_id}.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "layer_name",
-                "total_params",
-                "nonzero_params",
-                "fraction_pruned",
-                "fraction_remaining",
-            ]
-        )
-        for row in rows:
-            writer.writerow(row)
-
-
-def get_attention_mlp_breakdown(model: PreTrainedModel, model_id: str = "model"):
-    """
-    Computes sparsity breakdown for:
-      - The attention projection sub-layers (q_proj, k_proj, v_proj, o_proj)
-      - The MLP sub-layers (gate_proj, up_proj, down_proj)
-    Saves CSV: `results/attention_mlp_breakdown_{model_id}.csv`.
-
-    CSV columns:
-      - sublayer_type (e.g. 'attention_qkv', 'mlp_up_proj', etc.)
-      - total_params
-      - nonzero_params
-      - fraction_pruned
-      - fraction_remaining
-    """
-    _ensure_results_dir()
-    # We'll track counts in a dictionary keyed by sublayer type
-    stats = {}
-
-    def update_stats(key, tensor):
-        tnum = tensor.numel()
-        nz = torch.count_nonzero(tensor).item()
-        if key not in stats:
-            stats[key] = {"total": 0, "nonzero": 0}
-        stats[key]["total"] += tnum
-        stats[key]["nonzero"] += nz
-
-    for i, layer in enumerate(model.model.layers):
-        # Each layer should have 'self_attn' with q_proj, k_proj, v_proj, o_proj
-        # and 'mlp' with gate_proj, up_proj, down_proj
-        for name, param in layer.named_parameters():
-            if "weight" not in name:
-                continue
-            data = param.data
-            # Identify whether it's attention or MLP
-            if "self_attn.q_proj" in name:
-                update_stats("attention_q_proj", data)
-            elif "self_attn.k_proj" in name:
-                update_stats("attention_k_proj", data)
-            elif "self_attn.v_proj" in name:
-                update_stats("attention_v_proj", data)
-            elif "self_attn.o_proj" in name:
-                update_stats("attention_o_proj", data)
-            elif "mlp.gate_proj" in name:
-                update_stats("mlp_gate_proj", data)
-            elif "mlp.up_proj" in name:
-                update_stats("mlp_up_proj", data)
-            elif "mlp.down_proj" in name:
-                update_stats("mlp_down_proj", data)
-
-    # Convert to CSV
-    csv_path = f"results/attention_mlp_breakdown_{model_id}.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "sublayer_type",
-                "total_params",
-                "nonzero_params",
-                "fraction_pruned",
-                "fraction_remaining",
-            ]
-        )
-        for k, vals in stats.items():
-            total = vals["total"]
-            nz = vals["nonzero"]
-            fraction_pruned = (total - nz) / total
-            fraction_remaining = 1.0 - fraction_pruned
-            writer.writerow([k, total, nz, fraction_pruned, fraction_remaining])
-
-
-def get_heads_vs_intermediate_sparsity(model: PreTrainedModel, model_id: str = "model"):
-    """
-    Example function to measure how many weights remain in each attention head
-    vs. the MLP intermediate dimension. This is more detailed and requires
-    some knowledge about how LLaMA organizes heads. Here we do a
-    simplified approach: we collect Q/K/V by head dimension, and MLP separately.
-
-    Saves CSV: `results/heads_vs_intermediate_{model_id}.csv`.
-
-    CSV columns (one row per layer):
-      - layer_index
-      - total_qkv_params
-      - nonzero_qkv
-      - fraction_qkv_pruned
-      - total_mlp_params
-      - nonzero_mlp
-      - fraction_mlp_pruned
-      - fraction_remaining_qkv
-      - fraction_remaining_mlp
-    """
-    _ensure_results_dir()
-    rows = []
-
-    for i, layer in enumerate(model.model.layers):
-        qkv_total = 0
-        qkv_nonzero = 0
-        mlp_total = 0
-        mlp_nonzero = 0
-
-        for name, param in layer.named_parameters():
-            if "weight" not in name:
-                continue
-            data = param.data
-            if any(x in name for x in ["q_proj", "k_proj", "v_proj"]):
-                qkv_total += data.numel()
-                qkv_nonzero += torch.count_nonzero(data).item()
-            elif any(
-                x in name for x in ["mlp.up_proj", "mlp.down_proj", "mlp.gate_proj"]
-            ):
-                mlp_total += data.numel()
-                mlp_nonzero += torch.count_nonzero(data).item()
-
-        if qkv_total == 0:
-            qkv_total = 1
-        if mlp_total == 0:
-            mlp_total = 1
-
-        qkv_frac_pruned = (qkv_total - qkv_nonzero) / qkv_total
-        mlp_frac_pruned = (mlp_total - mlp_nonzero) / mlp_total
-
-        rows.append(
-            [
-                i,
-                qkv_total,
-                qkv_nonzero,
-                qkv_frac_pruned,
-                mlp_total,
-                mlp_nonzero,
-                mlp_frac_pruned,
-                1.0 - qkv_frac_pruned,
-                1.0 - mlp_frac_pruned,
-            ]
-        )
-
-    csv_path = f"results/heads_vs_intermediate_{model_id}.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "layer_index",
-                "total_qkv_params",
-                "nonzero_qkv",
-                "fraction_qkv_pruned",
-                "total_mlp_params",
-                "nonzero_mlp",
-                "fraction_mlp_pruned",
-                "fraction_remaining_qkv",
-                "fraction_remaining_mlp",
-            ]
-        )
-        for row in rows:
-            writer.writerow(row)
-
-
-def compute_mask_overlap(
-    maskA: torch.Tensor, maskB: torch.Tensor, metric: str = "jaccard"
-):
-    """
-    Compute overlap between two Boolean masks of the same shape.
-    By default we use Jaccard similarity:
-       jaccard = intersection / union
-    (where intersection is the count of True in both, union is True in either).
-
-    If you want another metric, you could implement 'cosine', etc.
-    """
-    assert maskA.shape == maskB.shape, "Masks must have the same shape"
-    intersection = torch.logical_and(maskA, maskB).sum().item()
-    union = torch.logical_or(maskA, maskB).sum().item()
-    if union == 0:
-        return 1.0 if intersection == 0 else 0.0
-    if metric == "jaccard":
-        return intersection / union
+    base = os.path.basename(model_path)
+    if "--" in base:
+        # e.g. meta-llama--AST_25pct
+        prefix, details = base.split("--", 1)
+        detail_parts = details.split("_")
+        model_name = detail_parts[0] if len(detail_parts) > 0 else base
+        pruned_on = detail_parts[1] if len(detail_parts) > 1 else "None"
+        sparsity = detail_parts[2] if len(detail_parts) > 2 else "0%"
     else:
-        raise ValueError(f"Unsupported metric: {metric}")
+        model_name = base
+        pruned_on = "None"
+        sparsity = "0%"
+    model_type = (
+        "pruned" if "pruned" in base.lower() or "pct" in base.lower() else "raw"
+    )
+    return model_type, model_name, pruned_on, sparsity
 
 
-def get_mask_overlap(
-    modelA: PreTrainedModel,
-    modelB: PreTrainedModel,
-    model_id_a: str = "modelA",
-    model_id_b: str = "modelB",
-    metric: str = "jaccard",
-):
+# 1. Layer-wise Weight Distribution
+def get_layerwise_weight_distribution(model_paths: list[str]):
     """
-    Computes the (global) mask overlap between two LLaMA models
-    (assuming they've been pruned and have zeros for pruned weights).
-    We gather all weight parameters, build a single combined mask for each model,
-    then compute overlap according to `metric`.
-
-    Saves CSV file: results/mask_overlap_{model_id_a}_vs_{model_id_b}.csv
-      columns: [overlap_metric, overlap_score, intersection, union]
+    For each model, compute per-layer weight distribution statistics and append each model's results
+    immediately to 'results/layerwise_weight_distribution.csv'
     """
     _ensure_results_dir()
-
-    # Create one big flatten mask for each model
-    maskA_list = []
-    maskB_list = []
-    for paramA, paramB in zip(modelA.parameters(), modelB.parameters()):
-        if paramA.dim() == 0 or paramB.dim() == 0:
-            # skip scalars
+    csv_path = os.path.join("results", "layerwise_weight_distribution.csv")
+    # Write header once
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "type",
+                "name",
+                "pruned_on",
+                "sparsity",
+                "layer",
+                "mean",
+                "std",
+                "min",
+                "max",
+                "l2_norm",
+                "total_params",
+                "nonzero_params",
+            ]
+        )
+    for model_path in model_paths:
+        try:
+            print(f"[LayerWeightDist] Analyzing model from: {model_path}")
+            model = load_model(model_path)
+            model_type, model_name, pruned_on, sparsity = extract_model_details(
+                model_path
+            )
+            rows = []
+            for name, param in model.named_parameters():
+                if param.dim() == 0:
+                    continue  # skip scalars
+                data = param.data.cpu().float().numpy()
+                mean_val = np.mean(data)
+                std_val = np.std(data)
+                min_val = np.min(data)
+                max_val = np.max(data)
+                l2_norm = np.linalg.norm(data)
+                total_count = data.size
+                nonzero_count = np.count_nonzero(data)
+                rows.append(
+                    [
+                        model_type,
+                        model_name,
+                        pruned_on,
+                        sparsity,
+                        name,
+                        f"{mean_val:.4f}",
+                        f"{std_val:.4f}",
+                        f"{min_val:.4f}",
+                        f"{max_val:.4f}",
+                        f"{l2_norm:.4f}",
+                        total_count,
+                        nonzero_count,
+                    ]
+                )
+            del model
+            clear_gpu_memory()
+        except Exception as e:
+            print(
+                f"Error in layer-wise weight distribution for model at {model_path}: {str(e)}"
+            )
             continue
-        # Compute boolean masks
-        mA = (paramA.data != 0.0).view(-1)
-        mB = (paramB.data != 0.0).view(-1)
-        # Append
-        maskA_list.append(mA)
-        maskB_list.append(mB)
-
-    allA = torch.cat(maskA_list, dim=0)
-    allB = torch.cat(maskB_list, dim=0)
-
-    intersection = torch.logical_and(allA, allB).sum().item()
-    union = torch.logical_or(allA, allB).sum().item()
-
-    if union == 0:
-        overlap_score = 1.0 if intersection == 0 else 0.0
-    else:
-        overlap_score = intersection / union
-
-    csv_path = f"results/mask_overlap_{model_id_a}_vs_{model_id_b}.csv"
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["overlap_metric", "overlap_score", "intersection", "union"])
-        writer.writerow([metric, overlap_score, intersection, union])
+        # Append the results for this model immediately.
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+        print(f"[LayerWeightDist] Processed {model_path} and appended results.")
 
 
-def get_layer_by_layer_mask_overlap(
-    modelA: PreTrainedModel,
-    modelB: PreTrainedModel,
-    model_id_a: str = "modelA",
-    model_id_b: str = "modelB",
-    metric: str = "jaccard",
-):
+# 3. Activation Analysis
+def get_activation_statistics(model_paths: list[str]):
     """
-    For each layer i, compute the overlap in that layer's weight masks
-    and write them as rows in a CSV.
-    CSV: results/layer_by_layer_overlap_{model_id_a}_vs_{model_id_b}.csv
-
-    columns:
-      - layer_index
-      - sublayer_name (like 'self_attn.q_proj' or 'mlp.up_proj')
-      - intersection
-      - union
-      - overlap (intersection/union)
+    For each model, registers forward hooks to capture activation statistics and
+    immediately appends each model's results to 'results/activation_statistics.csv'
     """
     _ensure_results_dir()
-    # We'll iterate over corresponding layers in both models
-    # and compute mask overlap sublayer by sublayer.
-    rows = []
-    for i, (layerA, layerB) in enumerate(zip(modelA.model.layers, modelB.model.layers)):
-        # gather submodules
-        for (nameA, paramA), (nameB, paramB) in zip(
-            layerA.named_parameters(), layerB.named_parameters()
-        ):
-            if "weight" not in nameA:
-                continue
-            assert nameA == nameB, "Mismatch in sublayer structure"
-            dataA = paramA.data
-            dataB = paramB.data
-
-            # Flatten
-            maskA = (dataA != 0.0).view(-1)
-            maskB = (dataB != 0.0).view(-1)
-            intersection = torch.logical_and(maskA, maskB).sum().item()
-            union = torch.logical_or(maskA, maskB).sum().item()
-
-            if union == 0:
-                overlap = 1.0 if intersection == 0 else 0.0
-            else:
-                overlap = intersection / union
-
-            rows.append([i, nameA, intersection, union, overlap])
-
-    # write to CSV
-    csv_path = f"results/layer_by_layer_overlap_{model_id_a}_vs_{model_id_b}.csv"
+    csv_path = os.path.join("results", "activation_statistics.csv")
+    # Write header once.
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["layer_index", "sublayer_name", "intersection", "union", "overlap"]
+            [
+                "type",
+                "name",
+                "pruned_on",
+                "sparsity",
+                "module",
+                "mean",
+                "std",
+                "min",
+                "max",
+            ]
         )
-        for row in rows:
+    for model_path in model_paths:
+        try:
+            print(f"[ActivationStats] Analyzing model from: {model_path}")
+            model = load_model(model_path)
+            model.eval()
+            model_type, model_name, pruned_on, sparsity = extract_model_details(
+                model_path
+            )
+            activation_stats = {}
+            hooks = []
+
+            def get_hook(name):
+                def hook(module, input, output):
+                    out = output[0] if isinstance(output, (list, tuple)) else output
+                    if torch.is_tensor(out):
+                        act = out.detach().cpu().float()
+                        activation_stats[name] = {
+                            "mean": act.mean().item(),
+                            "std": act.std().item(),
+                            "min": act.min().item(),
+                            "max": act.max().item(),
+                        }
+
+                return hook
+
+            # Register hooks on leaf modules.
+            for name, module in model.named_modules():
+                if (
+                    any(p.requires_grad for p in module.parameters())
+                    and len(list(module.children())) == 0
+                ):
+                    hooks.append(module.register_forward_hook(get_hook(name)))
+
+            vocab_size = (
+                model.config.vocab_size if hasattr(model.config, "vocab_size") else 1000
+            )
+            dummy_input = torch.randint(0, vocab_size, (1, 10)).to(
+                next(model.parameters()).device
+            )
+            with torch.no_grad():
+                model(dummy_input)
+
+            for h in hooks:
+                h.remove()
+
+            rows = []
+            for module_name, stats in activation_stats.items():
+                rows.append(
+                    [
+                        model_type,
+                        model_name,
+                        pruned_on,
+                        sparsity,
+                        module_name,
+                        f"{stats['mean']:.4f}",
+                        f"{stats['std']:.4f}",
+                        f"{stats['min']:.4f}",
+                        f"{stats['max']:.4f}",
+                    ]
+                )
+            del model
+            clear_gpu_memory()
+        except Exception as e:
+            print(f"Error in activation statistics for model at {model_path}: {str(e)}")
+            continue
+        # Append the results for this model immediately.
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+        print(f"[ActivationStats] Processed {model_path} and appended results.")
+
+
+# 4. Sensitivity Testing
+def get_sensitivity_analysis(model_paths: list[str]):
+    """
+    For each model, performs sensitivity analysis and appends each model's results immediately
+    to 'results/sensitivity_analysis.csv'
+    """
+    _ensure_results_dir()
+    csv_path = os.path.join("results", "sensitivity_analysis.csv")
+    # Write header once.
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["type", "name", "pruned_on", "sparsity", "module", "activation_diff"]
+        )
+    for model_path in model_paths:
+        try:
+            print(f"[SensitivityAnalysis] Analyzing model from: {model_path}")
+            model = load_model(model_path)
+            model.eval()
+            model_type, model_name, pruned_on, sparsity = extract_model_details(
+                model_path
+            )
+            baseline_acts = {}
+            perturbed_acts = {}
+            hooks = []
+
+            def get_hook(storage, name):
+                def hook(module, input, output):
+                    out = output[0] if isinstance(output, (list, tuple)) else output
+                    if torch.is_tensor(out):
+                        storage[name] = out.detach().cpu().float()
+
+                return hook
+
+            for name, module in model.named_modules():
+                if (
+                    any(p.requires_grad for p in module.parameters())
+                    and len(list(module.children())) == 0
+                ):
+                    hooks.append(
+                        (
+                            name,
+                            module.register_forward_hook(get_hook(baseline_acts, name)),
+                        )
+                    )
+
+            vocab_size = (
+                model.config.vocab_size if hasattr(model.config, "vocab_size") else 1000
+            )
+            dummy_input = torch.randint(0, vocab_size, (1, 10)).to(
+                next(model.parameters()).device
+            )
+            with torch.no_grad():
+                model(dummy_input)
+
+            for _, h in hooks:
+                h.remove()
+            hooks = []
+
+            for name, module in model.named_modules():
+                if (
+                    any(p.requires_grad for p in module.parameters())
+                    and len(list(module.children())) == 0
+                ):
+                    hooks.append(
+                        (
+                            name,
+                            module.register_forward_hook(
+                                get_hook(perturbed_acts, name)
+                            ),
+                        )
+                    )
+
+            perturbed_input = dummy_input.clone()
+            last_token = perturbed_input[0, -1].item()
+            new_token = (last_token + 1) % vocab_size
+            perturbed_input[0, -1] = new_token
+
+            with torch.no_grad():
+                model(perturbed_input)
+
+            for _, h in hooks:
+                h.remove()
+
+            rows = []
+            for module_name in baseline_acts.keys():
+                if module_name in perturbed_acts:
+                    diff = torch.norm(
+                        baseline_acts[module_name] - perturbed_acts[module_name]
+                    ).item()
+                    rows.append(
+                        [
+                            model_type,
+                            model_name,
+                            pruned_on,
+                            sparsity,
+                            module_name,
+                            f"{diff:.4f}",
+                        ]
+                    )
+            del model
+            clear_gpu_memory()
+        except Exception as e:
+            print(f"Error in sensitivity analysis for model at {model_path}: {str(e)}")
+            continue
+        # Append the results for this model immediately.
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+        print(f"[SensitivityAnalysis] Processed {model_path} and appended results.")
+
+
+def eval_zero_shot(
+    model,
+    tokenizer,
+    task_list,
+):
+    """
+    Evaluates zero-shot performance on a set of tasks.
+    """
+
+    from lm_eval import evaluator
+    from lm_eval.models.huggingface import HFLM
+
+    wrapped_model = HFLM(pretrained=model, tokenizer=tokenizer)
+    results = evaluator.simple_evaluate(
+        model=wrapped_model,
+        tasks=task_list,
+        num_fewshot=0,
+        device="cuda",
+        limit=1000,
+    )
+    return results
+
+
+def run_eval_zero_shot_all(
+    model_paths: list,
+    tokenizer,
+    task_list=[
+        "hellaswag",
+        "winogrande",
+        "arc_easy",
+        "boolq",
+        "arc_challenge",
+        "wikitext",
+    ],
+) -> None:
+    """
+    Evaluates zero-shot performance on a set of tasks and appends each model's results immediately
+    to 'results/eval_zero_shot_summary.csv'
+    """
+    # Monkey-patch datasets.load_dataset to include trust_remote_code=True
+    import datasets
+
+    _orig_load_dataset = datasets.load_dataset
+
+    def _load_dataset_with_trust(*args, **kwargs):
+        kwargs.setdefault("trust_remote_code", True)
+        return _orig_load_dataset(*args, **kwargs)
+
+    datasets.load_dataset = _load_dataset_with_trust
+
+    _ensure_results_dir()
+    csv_path = os.path.join("results", "eval_zero_shot_summary.csv")
+    header = ["model_type", "model_name", "pruned_on", "sparsity"] + task_list
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+    model_paths = [model_path for model_path in model_paths if "3b" in model_path]
+    for model_path in model_paths:
+        try:
+            print(f"[ZeroShot] Loading model from: {model_path}")
+            model = load_model(model_path)
+            model_type, model_name, pruned_on, sparsity = extract_model_details(
+                model_path
+            )
+            res = eval_zero_shot(model, tokenizer, task_list)
+            row = [model_type, model_name, pruned_on, sparsity]
+            for task in task_list:
+                if task in res["results"]:
+                    score = (
+                        res["results"][task].get("acc,none", "N/A")
+                        if task != "wikitext"
+                        else res["results"][task].get("word_perplexity,none", "N/A")
+                    )
+                else:
+                    score = "N/A"
+                row.append(score)
+            del model
+            clear_gpu_memory()
+        except Exception as e:
+            print(f"Error evaluating model at {model_path}: {str(e)}")
+            continue
+        # Append the row for this model immediately.
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
             writer.writerow(row)
+        print(f"[ZeroShot] Processed {model_path} and appended results.")
+
+
+def get_attention_heads_statistics(
+    model_paths: list[str],
+    seq_len: int = 32,
+    results_csv="results/attention_heads_stats.csv",
+):
+    """
+    For each model, captures the attention probabilities for each layer and each head
+    on a dummy input (length=seq_len), then computes basic stats: mean, std, min, max
+    across the attention matrix. Writes them to a CSV file with columns:
+      type, name, pruned_on, sparsity, layer_index, head_index, mean_attn, std_attn, min_attn, max_attn
+
+    Args:
+      model_paths: list of model checkpoint directories
+      seq_len: length of the dummy input
+      results_csv: path to the output CSV
+    """
+    import csv
+
+    import torch
+
+    _ensure_results_dir()  # ensure 'results/' folder
+    # Write CSV header
+    with open(results_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "type",
+                "name",
+                "pruned_on",
+                "sparsity",
+                "layer_index",
+                "head_index",
+                "mean_attn",
+                "std_attn",
+                "min_attn",
+                "max_attn",
+            ]
+        )
+
+    for model_path in model_paths:
+        try:
+            print(f"[AttentionHeadsStats] Analyzing model from: {model_path}")
+            model = load_model(model_path)
+            model_type, model_name, pruned_on, sparsity = extract_model_details(
+                model_path
+            )
+
+            # Some models require the config to explicitly return attentions.
+            # We'll do: model.config.output_attentions = True
+            model.config.output_attentions = True
+            model.eval()
+
+            # Create dummy input
+            vocab_size = (
+                model.config.vocab_size
+                if hasattr(model.config, "vocab_size")
+                else 30522
+            )
+            dummy_input = torch.randint(0, vocab_size, (1, seq_len)).to(
+                next(model.parameters()).device
+            )
+
+            with torch.no_grad():
+                outputs = model(dummy_input, output_attentions=True)
+                # outputs.attentions is a tuple of shape (#layers, ), each is (batch_size, num_heads, seq_len, seq_len)
+
+            if not hasattr(outputs, "attentions") or outputs.attentions is None:
+                print(f"  -> No attentions returned for model {model_name}. Skipping.")
+                del model
+                clear_gpu_memory()
+                continue
+
+            # We'll collect rows to write after processing all heads
+            csv_rows = []
+
+            # Loop over each layer
+            for layer_idx, attn_tensor in enumerate(outputs.attentions):
+                # attn_tensor shape = (batch_size=1, num_heads, seq_len, seq_len)
+                attn_array = (
+                    attn_tensor[0].cpu().float().numpy()
+                )  # shape = (num_heads, seq_len, seq_len)
+                num_heads = attn_array.shape[0]
+                for head_idx in range(num_heads):
+                    mat = attn_array[head_idx]  # shape = (seq_len, seq_len)
+                    mean_val = float(mat.mean())
+                    std_val = float(mat.std())
+                    min_val = float(mat.min())
+                    max_val = float(mat.max())
+
+                    csv_rows.append(
+                        [
+                            model_type,
+                            model_name,
+                            pruned_on,
+                            sparsity,
+                            layer_idx,
+                            head_idx,
+                            f"{mean_val:.6f}",
+                            f"{std_val:.6f}",
+                            f"{min_val:.6f}",
+                            f"{max_val:.6f}",
+                        ]
+                    )
+
+            # Append results for this model
+            with open(results_csv, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(csv_rows)
+
+            del model
+            clear_gpu_memory()
+            print(f"[AttentionHeadsStats] Processed {model_path} and appended results.")
+
+        except Exception as e:
+            print(
+                f"Error in attention heads statistics for model at {model_path}: {str(e)}"
+            )
+            continue
